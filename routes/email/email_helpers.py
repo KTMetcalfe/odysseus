@@ -246,6 +246,33 @@ def _microsoft_token_endpoint() -> str:
     )
 
 
+def _microsoft_authorize_endpoint() -> str:
+    return (
+        "https://login.microsoftonline.com/"
+        f"{microsoft_oauth_tenant()}/oauth2/v2.0/authorize"
+    )
+
+
+def microsoft_oauth_redirect_uri() -> str:
+    """Callback URL for the optional authorization-code (redirect) flow.
+
+    Empty means the device-code flow is used. Microsoft accepts plain-http
+    redirect URIs only for localhost, so a set value is normally https://.
+    """
+    return os.environ.get("MICROSOFT_OAUTH_REDIRECT_URI", "").strip()
+
+
+def _microsoft_client_secret_params() -> dict:
+    """`client_secret` for a confidential ("Web" platform) registration.
+
+    A public client (device flow, or a "Mobile and desktop" redirect) has no
+    secret; a Web-platform registration requires it on every token request,
+    refreshes included.
+    """
+    secret = os.environ.get("MICROSOFT_OAUTH_CLIENT_SECRET", "").strip()
+    return {"client_secret": secret} if secret else {}
+
+
 def _refresh_microsoft_token(account_id: str) -> str | None:
     """Exchange the stored refresh token for a new access token and persist it.
 
@@ -274,6 +301,7 @@ def _refresh_microsoft_token(account_id: str) -> str | None:
                 "refresh_token": refresh_token,
                 "grant_type": "refresh_token",
                 "scope": MICROSOFT_OAUTH_SCOPES,
+                **_microsoft_client_secret_params(),
             },
             timeout=10,
         )

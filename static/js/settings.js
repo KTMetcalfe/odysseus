@@ -2491,6 +2491,15 @@ async function initEmailAccountsSettings() {
     // first, then redirect to Google OAuth or run the Microsoft device-code
     // flow inline (no redirect URI needed).
     async function _runMsDeviceFlow(accId) {
+      // With MICROSOFT_OAUTH_REDIRECT_URI set, sign in by redirect (like
+      // Google); otherwise run the device-code flow below.
+      try {
+        const cfg = await (await fetch('/api/email/oauth/microsoft/config', { credentials: 'same-origin' })).json();
+        if (cfg && cfg.redirect) {
+          window.location.href = `/api/email/oauth/microsoft/authorize?account_id=${encodeURIComponent(accId)}`;
+          return;
+        }
+      } catch (_) { /* fall back to the device flow */ }
       // Shared device-flow runner + the same code/Copy/Authorize panel the
       // Copilot and ChatGPT sign-ins use.
       const box = el('eaf-oauth-device');
@@ -4222,6 +4231,15 @@ async function initUnifiedIntegrations() {
 
     // Microsoft device-code flow — run inline, no redirect URI needed.
     async function _runMsDeviceFlow(accId) {
+      // With MICROSOFT_OAUTH_REDIRECT_URI set, sign in by redirect (like
+      // Google); otherwise run the device-code flow below.
+      try {
+        const cfg = await (await fetch('/api/email/oauth/microsoft/config', { credentials: 'same-origin' })).json();
+        if (cfg && cfg.redirect) {
+          window.location.href = `/api/email/oauth/microsoft/authorize?account_id=${encodeURIComponent(accId)}`;
+          return;
+        }
+      } catch (_) { /* fall back to the device flow */ }
       // Shared device-flow runner + the same code/Copy/Authorize panel the
       // Copilot and ChatGPT sign-ins use.
       const box = el('uf-oauth-device');

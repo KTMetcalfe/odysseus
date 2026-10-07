@@ -15,6 +15,7 @@ handlers need. The split is mechanical — no behavior change.
 import asyncio
 import os
 import sqlite3 as _sql3
+import threading
 import time
 import email as email_mod
 import email.header
@@ -63,6 +64,7 @@ from .email_helpers import (
     make_oauth_state, verify_oauth_state,
     microsoft_oauth_configured, microsoft_oauth_tenant, _microsoft_token_endpoint,
     MICROSOFT_OAUTH_SCOPES, microsoft_oauth_imap_policy_error, microsoft_oauth_smtp_policy_error,
+    microsoft_oauth_redirect_uri, _microsoft_authorize_endpoint, _microsoft_client_secret_params,
     _normalized_mail_host,
     EmailNotConfiguredError,
     _imap_connect, _imap, _decode_header, _detect_sent_folder, _detect_drafts_folder,
@@ -7426,10 +7428,81 @@ def setup_email_routes():
             expires_in=int(data.get("expires_in") or 900),
         )
 
-    async def _poll_ms_device_flow(_request, pending) -> "DeviceFlowPoll":
-        import httpx
+    class _MsTokensRejected(Exception):
+        """Microsoft returned tokens that must not be stored on this row.
+
+        `code` is a short machine reason (used in the redirect flow's
+        email_oauth_error), `message` the user-facing explanation."""
+
+        def __init__(self, code: str, message: str):
+            super().__init__(message)
+            self.code = code
+            self.message = message
+
+    def _ms_store_tokens(account_id: str, owner: str, data: dict) -> str:
+        """Verify and persist a Microsoft token response on the account row.
+
+        Shared by the device-code poll and the redirect callback so both
+        apply the same ownership and mailbox-identity checks. Returns the
+        verified mailbox identity; raises _MsTokensRejected otherwise."""
         from core.database import SessionLocal, EmailAccount
         from src.secret_storage import encrypt as _enc
+        access_token = data.get("access_token") or ""
+        refresh_token = data.get("refresh_token") or ""
+        if not access_token or not refresh_token:
+            raise _MsTokensRejected(
+                "token_exchange_failed",
+                "Microsoft omitted the offline refresh token — retry the sign-in",
+            )
+        identity = _ms_id_token_identity(data.get("id_token") or "")
+        db = SessionLocal()
+        try:
+            row = db.query(EmailAccount).filter(EmailAccount.id == account_id).first()
+            if not row or (owner and not _account_visible_to_owner(row, owner)):
+                raise _MsTokensRejected(
+                    "account_not_found", "Email account disappeared — save it and retry",
+                )
+            # SECURITY: a reconnect must prove the token belongs to the
+            # mailbox configured on this row (mirrors the Google flow) —
+            # otherwise authorizing a different Microsoft account pairs
+            # another identity's credentials with our usernames.
+            verified = identity.strip().casefold()
+            if not verified:
+                raise _MsTokensRejected(
+                    "identity_verification_failed",
+                    "Could not determine the authorized mailbox — retry the sign-in",
+                )
+            # Every username already on the row must be the authorized mailbox
+            # (as in the Google flow). Check before filling blanks: adopting the
+            # identity into an empty field first would make any identity match.
+            configured_logins = {
+                value.strip().casefold()
+                for value in (row.imap_user or "", row.smtp_user or "")
+                if value.strip()
+            }
+            if any(login != verified for login in configured_logins):
+                raise _MsTokensRejected(
+                    "identity_verification_failed",
+                    f"Authorized as {identity} but this mailbox is configured "
+                    f"for {row.imap_user or 'a different user'} — update the "
+                    "Username field to match and retry",
+                )
+            # First-time connect with no username typed: adopt the identity.
+            if not (row.imap_user or "").strip():
+                row.imap_user = identity
+            if not (row.smtp_user or "").strip():
+                row.smtp_user = identity
+            row.oauth_provider = "microsoft"
+            row.oauth_access_token = _enc(access_token)
+            row.oauth_refresh_token = _enc(refresh_token)
+            row.oauth_token_expiry = str(int(time.time()) + data.get("expires_in", 3600))
+            db.commit()
+            return identity
+        finally:
+            db.close()
+
+    async def _poll_ms_device_flow(_request, pending) -> "DeviceFlowPoll":
+        import httpx
         account_id = pending.get("account_id") or ""
         owner = pending.get("owner") or ""
         client_id = os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", "").strip()
@@ -7451,56 +7524,11 @@ def setup_email_routes():
         except Exception:
             data = {}
 
-        access_token = data.get("access_token")
-        if resp.is_success and access_token:
-            refresh_token = data.get("refresh_token") or ""
-            if not refresh_token:
-                return DeviceFlowPoll.failed(
-                    "Microsoft omitted the offline refresh token — retry the sign-in"
-                )
-            identity = _ms_id_token_identity(data.get("id_token") or "")
-            db = SessionLocal()
+        if resp.is_success and data.get("access_token"):
             try:
-                row = db.query(EmailAccount).filter(EmailAccount.id == account_id).first()
-                if not row:
-                    return DeviceFlowPoll.failed("Email account disappeared — save it and retry")
-                if owner and not _account_visible_to_owner(row, owner):
-                    return DeviceFlowPoll.failed("Email account disappeared — save it and retry")
-                # SECURITY: a reconnect must prove the token belongs to the
-                # mailbox configured on this row (mirrors the Google flow) —
-                # otherwise authorizing a different Microsoft account pairs
-                # another identity's credentials with our usernames.
-                verified = identity.strip().casefold()
-                if not verified:
-                    return DeviceFlowPoll.failed(
-                        "Could not determine the authorized mailbox — retry the sign-in"
-                    )
-                # Every username already on the row must be the authorized mailbox
-                # (as in the Google flow). Check before filling blanks: adopting the
-                # identity into an empty field first would make any identity match.
-                configured_logins = {
-                    value.strip().casefold()
-                    for value in (row.imap_user or "", row.smtp_user or "")
-                    if value.strip()
-                }
-                if any(login != verified for login in configured_logins):
-                    return DeviceFlowPoll.failed(
-                        f"Authorized as {identity} but this mailbox is configured "
-                        f"for {row.imap_user or 'a different user'} — update the "
-                        "Username field to match and retry"
-                    )
-                # First-time connect with no username typed: adopt the identity.
-                if not (row.imap_user or "").strip():
-                    row.imap_user = identity
-                if not (row.smtp_user or "").strip():
-                    row.smtp_user = identity
-                row.oauth_provider = "microsoft"
-                row.oauth_access_token = _enc(access_token)
-                row.oauth_refresh_token = _enc(refresh_token)
-                row.oauth_token_expiry = str(int(time.time()) + data.get("expires_in", 3600))
-                db.commit()
-            finally:
-                db.close()
+                identity = _ms_store_tokens(account_id, owner, data)
+            except _MsTokensRejected as rejected:
+                return DeviceFlowPoll.failed(rejected.message)
             return DeviceFlowPoll.authorized(
                 {"account_id": account_id, "email": identity}
             )
@@ -7526,5 +7554,127 @@ def setup_email_routes():
             authorize=lambda request: require_user(request) or "",
         )
     )
+
+    # ── Microsoft OAuth2 (authorization-code redirect, optional) ──────────
+    # With MICROSOFT_OAUTH_REDIRECT_URI set, "Sign in with Microsoft" sends
+    # the browser to Microsoft and back instead of showing a device code.
+    # Microsoft only allows http:// redirect URIs for localhost, so this is
+    # for deployments already behind HTTPS; the device flow stays the
+    # default. PKCE (S256) is always used. MICROSOFT_OAUTH_CLIENT_SECRET is
+    # needed only for a "Web" platform (confidential) registration.
+
+    # PKCE verifiers by state nonce. Server-side because the state travels
+    # through the browser: a verifier inside it would let whoever sees the
+    # callback URL redeem the code. Single-use, 10-minute lifetime.
+    _ms_pkce_verifiers: dict[str, tuple[str, float]] = {}
+    _ms_pkce_lock = threading.Lock()
+    _MS_PKCE_TTL_SECONDS = 600
+
+    def _ms_pkce_put(nonce: str, verifier: str) -> None:
+        now = time.time()
+        with _ms_pkce_lock:
+            for key in [k for k, (_, exp) in _ms_pkce_verifiers.items() if exp < now]:
+                _ms_pkce_verifiers.pop(key, None)
+            _ms_pkce_verifiers[nonce] = (verifier, now + _MS_PKCE_TTL_SECONDS)
+
+    def _ms_pkce_pop(nonce: str) -> str | None:
+        with _ms_pkce_lock:
+            entry = _ms_pkce_verifiers.pop(nonce, None)
+        if not entry or entry[1] < time.time():
+            return None
+        return entry[0]
+
+    def _ms_oauth_redirect(error: str | None = None):
+        from fastapi.responses import RedirectResponse as _RR
+        if error:
+            return _RR(f"/?section=integrations&email_oauth_provider=microsoft&email_oauth_error={error}")
+        return _RR("/?section=integrations&email_oauth_provider=microsoft&email_oauth_success=1")
+
+    @router.get("/oauth/microsoft/config")
+    async def microsoft_oauth_config(owner: str = Depends(require_user)):
+        """Which Microsoft sign-in the UI should run (no secrets)."""
+        return {
+            "configured": microsoft_oauth_configured(),
+            "redirect": microsoft_oauth_configured() and bool(microsoft_oauth_redirect_uri()),
+        }
+
+    @router.get("/oauth/microsoft/authorize")
+    async def microsoft_oauth_authorize(account_id: str = Query(...), owner: str = Depends(require_user)):
+        import base64 as _b64
+        import hashlib as _hl
+        import secrets as _sec
+        import urllib.parse
+        from fastapi.responses import RedirectResponse as _RR
+        if not microsoft_oauth_configured():
+            raise HTTPException(400, "MICROSOFT_OAUTH_CLIENT_ID not set — add it to .env")
+        redirect_uri = microsoft_oauth_redirect_uri()
+        if not redirect_uri:
+            raise HTTPException(400, "MICROSOFT_OAUTH_REDIRECT_URI not set — use the device sign-in")
+        row = _ms_require_account(account_id, owner or "")
+        state = make_oauth_state(account_id, owner)
+        verifier = _sec.token_urlsafe(64)
+        challenge = _b64.urlsafe_b64encode(_hl.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        _ms_pkce_put(verify_oauth_state(state)["n"], verifier)
+        params = {
+            "client_id": os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", "").strip(),
+            "response_type": "code",
+            "response_mode": "query",
+            "redirect_uri": redirect_uri,
+            "scope": MICROSOFT_OAUTH_SCOPES,
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "prompt": "select_account",
+        }
+        login_hint = (row.imap_user or "").strip()
+        if login_hint:
+            params["login_hint"] = login_hint
+        return _RR(f"{_microsoft_authorize_endpoint()}?{urllib.parse.urlencode(params)}")
+
+    @router.get("/oauth/microsoft/callback")
+    async def microsoft_oauth_callback(
+        code: str = Query(None),
+        state: str = Query(None),
+        error: str = Query(None),
+    ):
+        import httpx
+        if error:
+            return _ms_oauth_redirect("microsoft_error")
+        if not code or not state:
+            return _ms_oauth_redirect("missing_code")
+        state_data = verify_oauth_state(state)
+        if not state_data:
+            return _ms_oauth_redirect("invalid_state")
+        # Single use: a replayed or expired state has no verifier left.
+        verifier = _ms_pkce_pop(state_data.get("n", ""))
+        if not verifier:
+            return _ms_oauth_redirect("invalid_state")
+        account_id = state_data.get("a", "")
+        owner = state_data.get("o", "")
+        try:
+            async with httpx.AsyncClient(timeout=_MS_OAUTH_HTTP_TIMEOUT) as client:
+                resp = await client.post(
+                    _microsoft_token_endpoint(),
+                    data={
+                        "client_id": os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", "").strip(),
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "redirect_uri": microsoft_oauth_redirect_uri(),
+                        "code_verifier": verifier,
+                        "scope": MICROSOFT_OAUTH_SCOPES,
+                        **_microsoft_client_secret_params(),
+                    },
+                )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logger.warning("Microsoft token exchange failed")
+            return _ms_oauth_redirect("token_exchange_failed")
+        try:
+            _ms_store_tokens(account_id, owner, data)
+        except _MsTokensRejected as rejected:
+            logger.warning("Microsoft OAuth callback rejected for account %s: %s", account_id, rejected.code)
+            return _ms_oauth_redirect(rejected.code)
+        return _ms_oauth_redirect()
 
     return router

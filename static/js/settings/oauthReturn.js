@@ -1,4 +1,4 @@
-// Return path from the Google OAuth2 redirect.
+// Return path from the Google / Microsoft OAuth2 redirect.
 //
 // The provider sends the browser back to the app root with a result in the
 // query string, so something has to notice on load and put the user back where
@@ -18,6 +18,7 @@ export function handleSettingsOauthReturn({ openSettings } = {}) {
   window.history.replaceState(null, '', clean);
   const success = sp.has('email_oauth_success');
   const errMsg = sp.get('email_oauth_error') || '';
+  const provider = sp.get('email_oauth_provider') === 'microsoft' ? 'Microsoft' : 'Google';
 
   // The caller passes its own open() in, so this never has to wait for a
   // window-level alias to exist.
@@ -26,8 +27,8 @@ export function handleSettingsOauthReturn({ openSettings } = {}) {
     // Brief toast-style banner.
     const banner = document.createElement('div');
     banner.textContent = success
-      ? 'Google account connected — email is ready'
-      : `Google OAuth failed: ${errMsg || 'unknown error'}`;
+      ? `${provider} account connected — email is ready`
+      : `${provider} OAuth failed: ${errMsg || 'unknown error'}`;
     Object.assign(banner.style, {
       position: 'fixed', bottom: '24px', left: '50%', transform: 'translateX(-50%)',
       background: success ? 'var(--accent, #50fa7b)' : 'var(--red, #ff5555)',

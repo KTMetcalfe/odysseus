@@ -728,3 +728,184 @@ def test_device_poll_adopts_identity_for_a_blank_account(device_app):
         assert row.oauth_provider == "microsoft"
     finally:
         db.close()
+# --- Optional redirect (authorization-code + PKCE) flow -----------------------
+
+_MS_EMAIL = "/api/email/oauth/microsoft"
+_REDIRECT = "https://odysseus.example.com/api/email/oauth/microsoft/callback"
+
+
+def _authorize(device_app, account_id, user="alice"):
+    from urllib.parse import parse_qs, urlparse
+
+    r = device_app.client.get(
+        f"{_MS_EMAIL}/authorize", params={"account_id": account_id},
+        headers=_as(user), follow_redirects=False,
+    )
+    assert r.status_code in (302, 307), r.text
+    loc = urlparse(r.headers["location"])
+    return loc, {k: v[0] for k, v in parse_qs(loc.query).items()}
+
+
+def _callback(device_app, **params):
+    r = device_app.client.get(f"{_MS_EMAIL}/callback", params=params, follow_redirects=False)
+    assert r.status_code in (302, 307), r.text
+    return r.headers["location"]
+
+
+def test_config_reports_redirect_only_when_redirect_uri_is_set(device_app, monkeypatch):
+    monkeypatch.delenv("MICROSOFT_OAUTH_REDIRECT_URI", raising=False)
+    assert device_app.client.get(f"{_MS_EMAIL}/config", headers=_as("alice")).json() == {"configured": True, "redirect": False}
+    monkeypatch.setenv("MICROSOFT_OAUTH_REDIRECT_URI", _REDIRECT)
+    assert device_app.client.get(f"{_MS_EMAIL}/config", headers=_as("alice")).json() == {"configured": True, "redirect": True}
+    assert device_app.client.get(f"{_MS_EMAIL}/config").status_code == 401
+
+
+def test_authorize_needs_a_redirect_uri(device_app, monkeypatch):
+    monkeypatch.delenv("MICROSOFT_OAUTH_REDIRECT_URI", raising=False)
+    account_id = _make_account(device_app.db, owner="alice")
+    r = device_app.client.get(f"{_MS_EMAIL}/authorize", params={"account_id": account_id}, headers=_as("alice"), follow_redirects=False)
+    assert r.status_code == 400
+
+
+def test_authorize_redirects_with_pkce_state_and_login_hint(device_app, monkeypatch):
+    from routes.email_helpers import verify_oauth_state
+
+    monkeypatch.setenv("MICROSOFT_OAUTH_REDIRECT_URI", _REDIRECT)
+    account_id = _make_account(device_app.db, owner="alice", imap_user="alice@contoso.com")
+    loc, q = _authorize(device_app, account_id)
+
+    assert f"{loc.scheme}://{loc.netloc}{loc.path}" == "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+    assert q["client_id"] == "client-123"
+    assert q["response_type"] == "code"
+    assert q["redirect_uri"] == _REDIRECT
+    assert q["code_challenge_method"] == "S256" and len(q["code_challenge"]) == 43
+    assert q["login_hint"] == "alice@contoso.com"
+    assert _DOCUMENTED_SCOPES <= set(q["scope"].split())
+    state = verify_oauth_state(q["state"])
+    assert state["a"] == account_id and state["o"] == "alice"
+    # The verifier never travels through the browser.
+    assert "code_verifier" not in q
+
+
+def test_authorize_refuses_another_users_account(device_app, monkeypatch):
+    monkeypatch.setenv("MICROSOFT_OAUTH_REDIRECT_URI", _REDIRECT)
+    account_id = _make_account(device_app.db, owner="alice")
+    r = device_app.client.get(f"{_MS_EMAIL}/authorize", params={"account_id": account_id}, headers=_as("bob"), follow_redirects=False)
+    assert r.status_code == 404
+
+
+@pytest.mark.parametrize("secret", ["", "s3cret"])
+def test_callback_exchanges_code_with_pkce_and_stores_tokens(device_app, monkeypatch, secret):
+    import hashlib
+    from core.database import EmailAccount
+    from src.secret_storage import decrypt
+
+    monkeypatch.setenv("MICROSOFT_OAUTH_REDIRECT_URI", _REDIRECT)
+    if secret:
+        monkeypatch.setenv("MICROSOFT_OAUTH_CLIENT_SECRET", secret)
+    else:
+        monkeypatch.delenv("MICROSOFT_OAUTH_CLIENT_SECRET", raising=False)
+    account_id = _make_account(device_app.db, owner="alice", imap_user="alice@contoso.com")
+    _, q = _authorize(device_app, account_id)
+    device_app.fake.script["token"] = (200, {
+        "access_token": "ms-access", "refresh_token": "ms-refresh", "expires_in": 3600,
+        "id_token": _jwt({"preferred_username": "alice@contoso.com"}),
+    })
+
+    loc = _callback(device_app, code="auth-code", state=q["state"])
+
+    assert loc == "/?section=integrations&email_oauth_provider=microsoft&email_oauth_success=1"
+    url, data = device_app.fake.calls[-1]
+    assert url == "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    assert data["grant_type"] == "authorization_code" and data["code"] == "auth-code"
+    assert data["redirect_uri"] == _REDIRECT
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(data["code_verifier"].encode()).digest()).decode().rstrip("=")
+    assert challenge == q["code_challenge"]
+    assert data.get("client_secret", "") == secret
+    db = device_app.db()
+    try:
+        row = db.get(EmailAccount, account_id)
+        assert row.oauth_provider == "microsoft"
+        assert decrypt(row.oauth_access_token) == "ms-access"
+        assert decrypt(row.oauth_refresh_token) == "ms-refresh"
+    finally:
+        db.close()
+
+
+def test_callback_state_is_single_use(device_app, monkeypatch):
+    monkeypatch.setenv("MICROSOFT_OAUTH_REDIRECT_URI", _REDIRECT)
+    account_id = _make_account(device_app.db, owner="alice", imap_user="alice@contoso.com")
+    _, q = _authorize(device_app, account_id)
+    device_app.fake.script["token"] = (200, {
+        "access_token": "a", "refresh_token": "r",
+        "id_token": _jwt({"preferred_username": "alice@contoso.com"}),
+    })
+    assert _callback(device_app, code="c", state=q["state"]).endswith("email_oauth_success=1")
+    calls = len(device_app.fake.calls)
+    assert _callback(device_app, code="c", state=q["state"]).endswith("email_oauth_error=invalid_state")
+    assert len(device_app.fake.calls) == calls  # no second exchange
+
+
+@pytest.mark.parametrize("params, reason", [
+    ({"error": "access_denied", "state": "x"}, "microsoft_error"),
+    ({"state": "x"}, "missing_code"),
+    ({"code": "c", "state": "forged"}, "invalid_state"),
+])
+def test_callback_rejects_bad_returns_without_exchanging(device_app, monkeypatch, params, reason):
+    monkeypatch.setenv("MICROSOFT_OAUTH_REDIRECT_URI", _REDIRECT)
+    assert _callback(device_app, **params).endswith(f"email_oauth_error={reason}")
+    assert device_app.fake.calls == []
+
+
+def test_callback_rejects_a_different_mailbox(device_app, monkeypatch):
+    from core.database import EmailAccount
+
+    monkeypatch.setenv("MICROSOFT_OAUTH_REDIRECT_URI", _REDIRECT)
+    account_id = _make_account(device_app.db, owner="alice", imap_user="alice@contoso.com", provider=None)
+    _, q = _authorize(device_app, account_id)
+    device_app.fake.script["token"] = (200, {
+        "access_token": "a", "refresh_token": "r",
+        "id_token": _jwt({"preferred_username": "mallory@contoso.com"}),
+    })
+    assert _callback(device_app, code="c", state=q["state"]).endswith("email_oauth_error=identity_verification_failed")
+    db = device_app.db()
+    try:
+        assert db.get(EmailAccount, account_id).oauth_provider is None
+    finally:
+        db.close()
+
+
+def test_refresh_sends_client_secret_for_web_registrations(account_db, monkeypatch):
+    import httpx
+    from routes.email_helpers import _refresh_microsoft_token
+
+    monkeypatch.setenv("MICROSOFT_OAUTH_CLIENT_ID", "client-123")
+    monkeypatch.setenv("MICROSOFT_OAUTH_CLIENT_SECRET", "s3cret")
+    account_id = _make_account(account_db)
+    captured = {}
+
+    def fake_post(url, data=None, timeout=None):
+        captured.update(data)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"access_token": "a", "expires_in": 3600})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    assert _refresh_microsoft_token(account_id) == "a"
+    assert captured["client_secret"] == "s3cret"
+
+
+@pytest.mark.parametrize("form", ["eaf", "uf"])
+def test_sign_in_uses_redirect_when_configured(form):
+    blocks = [b for b in _ms_device_flow_blocks() if f"el('{form}-oauth-device')" in b]
+    block = blocks[0]
+    cfg = block.index("fetch('/api/email/oauth/microsoft/config'")
+    assert "window.location.href = `/api/email/oauth/microsoft/authorize?account_id=${encodeURIComponent(accId)}`;" in block
+    # Decided before any device-flow UI is drawn.
+    assert cfg < block.index("runProviderDeviceFlow('microsoft-mail'")
+
+
+def test_oauth_return_banner_names_the_provider():
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "static" / "js" / "settings" / "oauthReturn.js").read_text(encoding="utf-8")
+    assert "sp.get('email_oauth_provider') === 'microsoft' ? 'Microsoft' : 'Google'" in src
+    assert "`${provider} account connected — email is ready`" in src
