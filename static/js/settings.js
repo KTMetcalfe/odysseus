@@ -26,6 +26,8 @@ import { providerLogo } from './providers.js';
 import { isAltGrEvent } from './platform.js';
 import { bindMenuDismiss } from './escMenuStack.js';
 import { invalidateSettings } from './appConfig.js';
+import { formatDeviceFlowError, runProviderDeviceFlow } from './providerDeviceFlow.js';
+import { renderDeviceAuthWaitPanel } from './deviceAuthPanel.js';
 import { SEARCH_PROVIDER_LOGOS as _SEARCH_PROVIDER_LOGOS } from './searchProviderIcons.js';
 
 let initialized = false;
@@ -2438,7 +2440,7 @@ async function initEmailAccountsSettings() {
     const eafProviderNotes = {
       outlook: {
         title: 'Outlook / Office 365 uses Microsoft sign-in',
-        body: 'Microsoft disables normal password login for IMAP/SMTP. Use "Sign in with Microsoft" below — a short code is confirmed at microsoft.com/devicelogin. Requires MICROSOFT_OAUTH_CLIENT_ID to be configured by the admin.',
+        body: 'Most Outlook and Microsoft 365 accounts no longer accept passwords for IMAP/SMTP. Use "Sign in with Microsoft" below. If your Exchange server still accepts passwords, choose Custom instead. Requires MICROSOFT_OAUTH_CLIENT_ID to be set by the admin.',
       },
     };
     const eafNoteEl = el('eaf-provider-note');
@@ -2482,70 +2484,43 @@ async function initEmailAccountsSettings() {
     // first, then redirect to Google OAuth or run the Microsoft device-code
     // flow inline (no redirect URI needed).
     async function _runMsDeviceFlow(accId) {
+      // Shared device-flow runner + the same code/Copy/Authorize panel the
+      // Copilot and ChatGPT sign-ins use.
       const box = el('eaf-oauth-device');
       const status = el('eaf-oauth-status');
       const btn = el('eaf-oauth-btn');
       btn.disabled = true;
       box.style.display = '';
-      box.innerHTML = 'Starting Microsoft sign-in…';
+      box.textContent = 'Starting Microsoft sign-in...';
+      const formData = new FormData();
+      formData.append('account_id', accId);
+      const clearBox = () => { box.innerHTML = ''; box.style.display = 'none'; };
       try {
-        const r = await fetch('/api/email/oauth/microsoft/device/start', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: `account_id=${encodeURIComponent(accId)}`,
+        const result = await runProviderDeviceFlow('microsoft-mail', {
+          openWindow: () => {},
+          formData,
+          onStart: ({ start, authUrl }) => renderDeviceAuthWaitPanel(box, {
+            userCode: start.user_code,
+            authUrl,
+            authLabel: 'Authorize with Microsoft',
+            waitLabel: 'Waiting for Microsoft authorization...',
+          }),
         });
-        const d = await r.json().catch(() => ({}));
-        if (!r.ok || !d.poll_id) {
-          box.innerHTML = `<span style="color:var(--red)">${esc(d.detail || d.error || 'Failed to start Microsoft sign-in')}</span>`;
-          btn.disabled = false;
-          return;
+        if (result.status === 'authorized') {
+          const email = result.endpoint && result.endpoint.email;
+          status.textContent = '✓ Connected via Microsoft OAuth' + (email ? ` (${email})` : '');
+          btn.textContent = 'Reconnect with Microsoft';
+          clearBox();
+        } else if (result.status === 'expired') {
+          status.textContent = 'Microsoft sign-in timed out — try again';
+          clearBox();
+        } else {
+          status.textContent = '';
+          box.innerHTML = `<span style="color:var(--red)">Microsoft sign-in failed: ${esc(result.error || 'denied')}</span>`;
         }
-        const link = d.verification_uri_complete || d.verification_uri || 'https://microsoft.com/devicelogin';
-        const code = d.user_code || '';
-        box.innerHTML =
-          `<div style="margin-bottom:4px">1. Open <a href="${esc(link)}" target="_blank" rel="noopener">${esc(link)}</a> and sign in with ${esc(el('eaf-imap-user').value.trim() || 'your Microsoft account')}</div>` +
-          (d.verification_uri_complete ? '' : `<div style="margin-bottom:4px">2. Enter this code: <b style="letter-spacing:1px">${esc(code)}</b></div>`) +
-          `<div id="eaf-oauth-poll" style="opacity:0.7">Waiting for authorization…</div>`;
-        const intervalMs = Math.max(parseInt(d.interval || 5, 10), 2) * 1000;
-        const deadline = Date.now() + (parseInt(d.expires_in || 900, 10) * 1000);
-        const poll = async () => {
-          if (Date.now() > deadline) {
-            status.textContent = 'Microsoft sign-in timed out — try again';
-            box.innerHTML = '';
-            btn.disabled = false;
-            return;
-          }
-          let pd = null;
-          try {
-            const res = await fetch('/api/email/oauth/microsoft/device/poll', {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-              body: `poll_id=${encodeURIComponent(d.poll_id)}`,
-            });
-            pd = await res.json().catch(() => ({}));
-          } catch (err) { /* transient network error — keep polling */ }
-          if (pd && pd.status === 'authorized') {
-            status.textContent = '✓ Connected via Microsoft OAuth' + (pd.endpoint && pd.endpoint.email ? ` (${pd.endpoint.email})` : '');
-            box.innerHTML = '<span style="color:var(--accent,#50fa7b)">Connected — you can close this panel.</span>';
-            btn.disabled = false;
-            btn.textContent = 'Reconnect with Microsoft';
-            return;
-          }
-          if (pd && pd.status === 'failed') {
-            status.textContent = '';
-            box.innerHTML = `<span style="color:var(--red)">Microsoft sign-in failed: ${esc(pd.error || 'denied')}</span>`;
-            btn.disabled = false;
-            return;
-          }
-          const pollEl = box.querySelector('#eaf-oauth-poll');
-          if (pollEl) pollEl.textContent = (pd && pd.detail) ? pd.detail : 'Waiting for authorization…';
-          setTimeout(poll, intervalMs);
-        };
-        setTimeout(poll, intervalMs);
       } catch (e) {
-        box.innerHTML = `<span style="color:var(--red)">${esc(String(e))}</span>`;
+        box.innerHTML = `<span style="color:var(--red)">${esc(formatDeviceFlowError(e))}</span>`;
+      } finally {
         btn.disabled = false;
       }
     }
@@ -4049,7 +4024,7 @@ async function initUnifiedIntegrations() {
       },
       outlook: {
         title: 'Outlook / Office 365 uses Microsoft sign-in',
-        body: 'Microsoft disables normal password login for IMAP/SMTP. Use "Sign in with Microsoft" below — a short code is confirmed at microsoft.com/devicelogin. Requires MICROSOFT_OAUTH_CLIENT_ID to be configured by the admin.',
+        body: 'Most Outlook and Microsoft 365 accounts no longer accept passwords for IMAP/SMTP. Use "Sign in with Microsoft" below. If your Exchange server still accepts passwords, choose Custom instead. Requires MICROSOFT_OAUTH_CLIENT_ID to be set by the admin.',
         url: 'https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/disable-basic-authentication-in-exchange-online',
         linkLabel: 'Read Microsoft note',
       },
@@ -4227,70 +4202,43 @@ async function initUnifiedIntegrations() {
 
     // Microsoft device-code flow — run inline, no redirect URI needed.
     async function _runMsDeviceFlow(accId) {
+      // Shared device-flow runner + the same code/Copy/Authorize panel the
+      // Copilot and ChatGPT sign-ins use.
       const box = el('uf-oauth-device');
       const status = el('uf-oauth-status');
       const btn = el('uf-oauth-btn');
       btn.disabled = true;
       box.style.display = '';
-      box.innerHTML = 'Starting Microsoft sign-in…';
+      box.textContent = 'Starting Microsoft sign-in...';
+      const formData = new FormData();
+      formData.append('account_id', accId);
+      const clearBox = () => { box.innerHTML = ''; box.style.display = 'none'; };
       try {
-        const r = await fetch('/api/email/oauth/microsoft/device/start', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: `account_id=${encodeURIComponent(accId)}`,
+        const result = await runProviderDeviceFlow('microsoft-mail', {
+          openWindow: () => {},
+          formData,
+          onStart: ({ start, authUrl }) => renderDeviceAuthWaitPanel(box, {
+            userCode: start.user_code,
+            authUrl,
+            authLabel: 'Authorize with Microsoft',
+            waitLabel: 'Waiting for Microsoft authorization...',
+          }),
         });
-        const d = await r.json().catch(() => ({}));
-        if (!r.ok || !d.poll_id) {
-          box.innerHTML = `<span style="color:var(--red)">${esc(d.detail || d.error || 'Failed to start Microsoft sign-in')}</span>`;
-          btn.disabled = false;
-          return;
+        if (result.status === 'authorized') {
+          const email = result.endpoint && result.endpoint.email;
+          status.textContent = '✓ Connected via Microsoft OAuth' + (email ? ` (${email})` : '');
+          btn.textContent = 'Reconnect with Microsoft';
+          clearBox();
+        } else if (result.status === 'expired') {
+          status.textContent = 'Microsoft sign-in timed out — try again';
+          clearBox();
+        } else {
+          status.textContent = '';
+          box.innerHTML = `<span style="color:var(--red)">Microsoft sign-in failed: ${esc(result.error || 'denied')}</span>`;
         }
-        const link = d.verification_uri_complete || d.verification_uri || 'https://microsoft.com/devicelogin';
-        const code = d.user_code || '';
-        box.innerHTML =
-          `<div style="margin-bottom:4px">1. Open <a href="${esc(link)}" target="_blank" rel="noopener">${esc(link)}</a> and sign in with ${esc(el('uf-imap-user').value.trim() || 'your Microsoft account')}</div>` +
-          (d.verification_uri_complete ? '' : `<div style="margin-bottom:4px">2. Enter this code: <b style="letter-spacing:1px">${esc(code)}</b></div>`) +
-          `<div id="uf-oauth-poll" style="opacity:0.7">Waiting for authorization…</div>`;
-        const intervalMs = Math.max(parseInt(d.interval || 5, 10), 2) * 1000;
-        const deadline = Date.now() + (parseInt(d.expires_in || 900, 10) * 1000);
-        const poll = async () => {
-          if (Date.now() > deadline) {
-            status.textContent = 'Microsoft sign-in timed out — try again';
-            box.innerHTML = '';
-            btn.disabled = false;
-            return;
-          }
-          let pd = null;
-          try {
-            const res = await fetch('/api/email/oauth/microsoft/device/poll', {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-              body: `poll_id=${encodeURIComponent(d.poll_id)}`,
-            });
-            pd = await res.json().catch(() => ({}));
-          } catch (err) { /* transient network error — keep polling */ }
-          if (pd && pd.status === 'authorized') {
-            status.textContent = '✓ Connected via Microsoft OAuth' + (pd.endpoint && pd.endpoint.email ? ` (${pd.endpoint.email})` : '');
-            box.innerHTML = '<span style="color:var(--accent,#50fa7b)">Connected — you can close this panel.</span>';
-            btn.disabled = false;
-            btn.textContent = 'Reconnect with Microsoft';
-            return;
-          }
-          if (pd && pd.status === 'failed') {
-            status.textContent = '';
-            box.innerHTML = `<span style="color:var(--red)">Microsoft sign-in failed: ${esc(pd.error || 'denied')}</span>`;
-            btn.disabled = false;
-            return;
-          }
-          const pollEl = box.querySelector('#uf-oauth-poll');
-          if (pollEl) pollEl.textContent = (pd && pd.detail) ? pd.detail : 'Waiting for authorization…';
-          setTimeout(poll, intervalMs);
-        };
-        setTimeout(poll, intervalMs);
       } catch (e) {
-        box.innerHTML = `<span style="color:var(--red)">${esc(String(e))}</span>`;
+        box.innerHTML = `<span style="color:var(--red)">${esc(formatDeviceFlowError(e))}</span>`;
+      } finally {
         btn.disabled = false;
       }
     }

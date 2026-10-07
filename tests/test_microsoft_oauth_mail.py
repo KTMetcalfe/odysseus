@@ -582,3 +582,31 @@ def test_live_form_restores_provider_before_dropdown_label_is_drawn():
     restore = src.index("if (_ufSavedOauthKey) el('uf-email-provider').value = _ufSavedOauthKey;")
     dropdown = src.index("// Custom dropdown wire-up")
     assert restore < dropdown
+
+
+def _ms_device_flow_blocks():
+    src = _settings_js()
+    marker = "async function _runMsDeviceFlow(accId) {"
+    blocks, pos = [], 0
+    while (pos := src.find(marker, pos)) != -1:
+        blocks.append(src[pos:src.index("\n    }\n", pos)])
+        pos += len(marker)
+    return blocks
+
+
+@pytest.mark.parametrize("form", ["eaf", "uf"])
+def test_microsoft_sign_in_reuses_shared_device_flow_panel(form):
+    blocks = [b for b in _ms_device_flow_blocks() if f"el('{form}-oauth-device')" in b]
+    assert len(blocks) == 1
+    block = blocks[0]
+    # Same runner + panel as the Copilot / ChatGPT sign-in, not a bespoke one.
+    assert "runProviderDeviceFlow('microsoft-mail'" in block
+    assert "renderDeviceAuthWaitPanel(box," in block
+    assert "openWindow: () => {}" in block
+    assert "<a href" not in block
+
+
+def test_outlook_note_keeps_most_accounts_wording():
+    src = _settings_js()
+    assert src.count("Most Outlook and Microsoft 365 accounts no longer accept passwords") == 2
+    assert "devicelogin" not in src
