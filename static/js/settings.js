@@ -2761,6 +2761,8 @@ async function initEmailAccountsSettings() {
     // creates the row first, and every later Save must update that row
     // rather than POST a second, token-less copy.
     let savedId = isEdit ? a.id : null;
+    // Whether that row holds OAuth tokens (saved before, or signed in here).
+    let oauthConnected = !!(isEdit && a.oauth_provider);
     formEl.style.display = '';
     // Small `?` indicator next to each label. Hover/focus to read the
     // hint via the native `title` tooltip. tabindex makes it
@@ -2924,6 +2926,7 @@ async function initEmailAccountsSettings() {
           const email = result.endpoint && result.endpoint.email;
           status.textContent = '✓ Connected via Microsoft OAuth' + (email ? ` (${email})` : '');
           btn.textContent = 'Reconnect with Microsoft';
+          oauthConnected = true;
           clearBox();
           // The row exists and is connected now — show it without waiting
           // for a Save.
@@ -4321,6 +4324,10 @@ async function initUnifiedIntegrations() {
         existing = (d.accounts || []).find(a => a.id === editId) || null;
       } catch (_) {}
     }
+    // Whether that row holds OAuth tokens (saved before, or signed in here).
+    // Until it does the server sees a password-less account, so Test can
+    // only report missing credentials.
+    let oauthConnected = !!(existing && existing.oauth_provider);
     const placeholderPass = (isEdit && existing) ? '(leave blank to keep current)' : '';
     // Small `?` indicator next to each label (native title tooltip).
     const _hint = (tip) =>
@@ -4650,6 +4657,7 @@ async function initUnifiedIntegrations() {
           const email = result.endpoint && result.endpoint.email;
           status.textContent = '✓ Connected via Microsoft OAuth' + (email ? ` (${email})` : '');
           btn.textContent = 'Reconnect with Microsoft';
+          oauthConnected = true;
           clearBox();
           // The row exists and is connected now — show it without waiting
           // for a Save.
@@ -4788,9 +4796,10 @@ async function initUnifiedIntegrations() {
       // via the account_id shortcut. Other overrides in the body still
       // win (server merges).
       if (savedId && !body.imap_password) body.account_id = savedId;
-      // An OAuth account has no password to test until it is signed in.
+      // An OAuth account has nothing to test until its sign-in completes
+      // (a started-but-unfinished sign-in has a row but no tokens yet).
       const testProvider = PROVIDERS[el('uf-email-provider').value] || PROVIDERS[_ufSavedOauthKey];
-      if (testProvider && testProvider.oauth && !body.account_id) {
+      if (testProvider && testProvider.oauth && !oauthConnected) {
         const m = el('uf-email-msg');
         m.textContent = testProvider.oauth === 'microsoft' ? 'Sign in with Microsoft first' : 'Connect with Google first';
         m.style.color = 'var(--red)';
