@@ -682,3 +682,48 @@ def test_live_form_reads_existing_only_after_declaring_it():
     src = _settings_js()
     body = src[src.index("async function showEmailForm(editId) {"):]
     assert body.index("let existing = null;") < body.index("let oauthConnected = !!(existing")
+
+
+def _poll_with_identity(device_app, account_id, upn):
+    poll_id = device_app.client.post(
+        f"{_DEVICE}/start", data={"account_id": account_id}, headers=_as("alice"),
+    ).json()["poll_id"]
+    device_app.fake.script["token"] = (200, {
+        "access_token": "ms-access", "refresh_token": "ms-refresh", "expires_in": 3600,
+        "id_token": _jwt({"preferred_username": upn}),
+    })
+    return device_app.client.post(f"{_DEVICE}/poll", data={"poll_id": poll_id}, headers=_as("alice")).json()
+
+
+def test_device_poll_rejects_another_mailbox_even_with_blank_smtp_user(device_app):
+    # Regression: the blank smtp_user used to be filled with the authorized
+    # identity *before* the membership check, so any identity passed.
+    from core.database import EmailAccount
+
+    account_id = _make_account(device_app.db, owner="alice", imap_user="alice@contoso.com", provider=None)
+    out = _poll_with_identity(device_app, account_id, "mallory@contoso.com")
+
+    assert out["status"] == "failed" and "mallory@contoso.com" in out["error"]
+    db = device_app.db()
+    try:
+        row = db.get(EmailAccount, account_id)
+        assert row.oauth_provider is None
+        assert not (row.smtp_user or "")
+    finally:
+        db.close()
+
+
+def test_device_poll_adopts_identity_for_a_blank_account(device_app):
+    from core.database import EmailAccount
+
+    account_id = _make_account(device_app.db, owner="alice", imap_user="", provider=None)
+    out = _poll_with_identity(device_app, account_id, "alice@contoso.com")
+
+    assert out["status"] == "authorized"
+    db = device_app.db()
+    try:
+        row = db.get(EmailAccount, account_id)
+        assert row.imap_user == row.smtp_user == "alice@contoso.com"
+        assert row.oauth_provider == "microsoft"
+    finally:
+        db.close()

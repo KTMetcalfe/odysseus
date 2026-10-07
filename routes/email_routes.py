@@ -6339,22 +6339,25 @@ def setup_email_routes():
                     return DeviceFlowPoll.failed(
                         "Could not determine the authorized mailbox — retry the sign-in"
                     )
-                # First-time connect with no username typed: adopt the identity.
-                if not (row.imap_user or "").strip():
-                    row.imap_user = identity
-                if not (row.smtp_user or "").strip():
-                    row.smtp_user = identity
+                # Every username already on the row must be the authorized mailbox
+                # (as in the Google flow). Check before filling blanks: adopting the
+                # identity into an empty field first would make any identity match.
                 configured_logins = {
                     value.strip().casefold()
                     for value in (row.imap_user or "", row.smtp_user or "")
                     if value.strip()
                 }
-                if verified not in configured_logins:
+                if any(login != verified for login in configured_logins):
                     return DeviceFlowPoll.failed(
                         f"Authorized as {identity} but this mailbox is configured "
                         f"for {row.imap_user or 'a different user'} — update the "
                         "Username field to match and retry"
                     )
+                # First-time connect with no username typed: adopt the identity.
+                if not (row.imap_user or "").strip():
+                    row.imap_user = identity
+                if not (row.smtp_user or "").strip():
+                    row.smtp_user = identity
                 row.oauth_provider = "microsoft"
                 row.oauth_access_token = _enc(access_token)
                 row.oauth_refresh_token = _enc(refresh_token)
