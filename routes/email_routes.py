@@ -60,7 +60,8 @@ from routes.email_helpers import (
     _get_valid_google_token, _get_valid_microsoft_token, _xoauth2_bytes, _xoauth2_raw,
     make_oauth_state, verify_oauth_state,
     microsoft_oauth_configured, microsoft_oauth_tenant, _microsoft_token_endpoint,
-    MICROSOFT_OAUTH_SCOPES,
+    MICROSOFT_OAUTH_SCOPES, microsoft_oauth_imap_policy_error, microsoft_oauth_smtp_policy_error,
+    _normalized_mail_host, _account_visible_to_owner,
     EmailNotConfiguredError,
     _imap_connect, _imap, _decode_header, _detect_sent_folder, _detect_drafts_folder,
     _extract_attachment_text, _list_attachments_from_msg, _has_visible_attachments, _is_likely_signature_image_attachment,
@@ -81,8 +82,6 @@ ODYSSEUS_MAIL_ORIGIN = "odysseus-ui"
 EMAIL_READ_ATTACHMENT_VERSION = 2
 _GOOGLE_OAUTH_IMAP_HOST = "imap.gmail.com"
 _GOOGLE_OAUTH_SMTP_HOST = "smtp.gmail.com"
-_MICROSOFT_OAUTH_IMAP_HOSTS = {"outlook.office365.com"}
-_MICROSOFT_OAUTH_SMTP_HOSTS = {"smtp.office365.com"}
 _SERVER_OWNED_OAUTH_FIELDS = {
     "oauth_provider",
     "oauth_access_token",
@@ -91,27 +90,12 @@ _SERVER_OWNED_OAUTH_FIELDS = {
 }
 
 
-def _normalized_mail_host(value) -> str:
-    """Normalize a mail hostname for exact provider-bound comparisons."""
-    return str(value or "").strip().lower().rstrip(".")
-
-
 def _google_oauth_imap_transport_allowed(port: int, starttls: bool) -> bool:
     return (port == 993 and not starttls) or (port == 143 and starttls)
 
 
 def _google_oauth_smtp_transport_allowed(port: int, security: str) -> bool:
     return (port == 465 and security == "ssl") or (port == 587 and security == "starttls")
-
-
-def _microsoft_oauth_imap_transport_allowed(port: int, starttls: bool) -> bool:
-    # Exchange Online IMAP: implicit TLS on 993 (standard) or STARTTLS on 143.
-    return (port == 993 and not starttls) or (port == 143 and starttls)
-
-
-def _microsoft_oauth_smtp_transport_allowed(port: int, security: str) -> bool:
-    # Exchange Online SMTP client submission: STARTTLS on 587 only.
-    return port == 587 and security == "starttls"
 
 def _email_style_key(account_id: str | None) -> str:
     return str(account_id or "").strip()
@@ -5908,10 +5892,10 @@ def setup_email_routes():
             imap_result = {"ok": False, "error": "Google OAuth IMAP requires imap.gmail.com"}
         elif oauth_provider == "google" and not _google_oauth_imap_transport_allowed(imap_port, imap_starttls):
             imap_result = {"ok": False, "error": "Google OAuth IMAP requires TLS on port 993 or STARTTLS on port 143"}
-        elif oauth_provider == "microsoft" and _normalized_mail_host(imap_host) not in _MICROSOFT_OAUTH_IMAP_HOSTS:
-            imap_result = {"ok": False, "error": "Microsoft OAuth IMAP requires outlook.office365.com"}
-        elif oauth_provider == "microsoft" and not _microsoft_oauth_imap_transport_allowed(imap_port, imap_starttls):
-            imap_result = {"ok": False, "error": "Microsoft OAuth IMAP requires TLS on port 993 or STARTTLS on port 143"}
+        elif oauth_provider == "microsoft" and (
+            ms_imap_err := microsoft_oauth_imap_policy_error(imap_host, imap_port, imap_starttls)
+        ):
+            imap_result = {"ok": False, "error": ms_imap_err}
         else:
             # Connection mode resolution:
             #   STARTTLS on  → plain IMAP4 + .starttls() (upgrade)
@@ -5954,17 +5938,18 @@ def setup_email_routes():
             smtp_result = {"ok": False, "error": smtp_port_err}
         elif oauth_provider == "google" and smtp_host and _normalized_mail_host(smtp_host) != _GOOGLE_OAUTH_SMTP_HOST:
             smtp_result = {"ok": False, "error": "Google OAuth SMTP requires smtp.gmail.com"}
-        elif oauth_provider == "microsoft" and smtp_host and _normalized_mail_host(smtp_host) not in _MICROSOFT_OAUTH_SMTP_HOSTS:
-            smtp_result = {"ok": False, "error": "Microsoft OAuth SMTP requires smtp.office365.com"}
         elif (
             oauth_provider == "microsoft"
             and smtp_host
-            and not _microsoft_oauth_smtp_transport_allowed(
-                smtp_port,
-                _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port}),
+            and (
+                ms_smtp_err := microsoft_oauth_smtp_policy_error(
+                    smtp_host,
+                    smtp_port,
+                    _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port}),
+                )
             )
         ):
-            smtp_result = {"ok": False, "error": "Microsoft OAuth SMTP requires STARTTLS on port 587"}
+            smtp_result = {"ok": False, "error": ms_smtp_err}
         elif (
             oauth_provider == "google"
             and smtp_host
@@ -6212,6 +6197,9 @@ def setup_email_routes():
     # with a short code, we poll for tokens, then persist them (encrypted)
     # on the account row — mirroring the Google flow's ownership guards.
 
+    # Device-code start/poll run on the event loop; bound each Microsoft call.
+    _MS_OAUTH_HTTP_TIMEOUT = 10.0
+
     def _ms_id_token_identity(id_token: str) -> str:
         """Best-effort mailbox identity from an ID token.
 
@@ -6246,12 +6234,12 @@ def setup_email_routes():
         db = SessionLocal()
         try:
             row = db.query(EmailAccount).filter(EmailAccount.id == account_id).first()
-            if not row:
+            # SECURITY: the device flow may only attach credentials to a row
+            # the initiator may act on — the same predicate every other email
+            # account route uses (covers legacy owner-less rows too). 404, not
+            # 403, so another user's account id isn't confirmed to exist.
+            if not row or (owner and not _account_visible_to_owner(row, owner)):
                 raise HTTPException(404, "Email account not found — save it first")
-            # SECURITY: same ownership model as the Google callback — the
-            # device flow may only attach credentials to the initiator's row.
-            if owner and row.owner and row.owner != owner:
-                raise HTTPException(403, "This email account belongs to another user")
             return row
         finally:
             db.close()
@@ -6266,15 +6254,17 @@ def setup_email_routes():
                 "set the env var, then retry",
             )
         account_id = str(form.get("account_id") or "").strip()
+        # require_user (run by the device-flow router) already authenticated
+        # the caller; this binds the flow to the account's owner.
         owner = get_current_user(request) or None
         _ms_require_account(account_id, owner or "")
         client_id = os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", "").strip()
         try:
-            resp = httpx.post(
-                f"https://login.microsoftonline.com/{microsoft_oauth_tenant()}/oauth2/v2.0/devicecode",
-                data={"client_id": client_id, "scope": MICROSOFT_OAUTH_SCOPES},
-                timeout=10,
-            )
+            async with httpx.AsyncClient(timeout=_MS_OAUTH_HTTP_TIMEOUT) as client:
+                resp = await client.post(
+                    f"https://login.microsoftonline.com/{microsoft_oauth_tenant()}/oauth2/v2.0/devicecode",
+                    data={"client_id": client_id, "scope": MICROSOFT_OAUTH_SCOPES},
+                )
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPStatusError as e:
@@ -6308,16 +6298,16 @@ def setup_email_routes():
         owner = pending.get("owner") or ""
         client_id = os.environ.get("MICROSOFT_OAUTH_CLIENT_ID", "").strip()
         try:
-            resp = httpx.post(
-                _microsoft_token_endpoint(),
-                data={
-                    "client_id": client_id,
-                    "device_code": pending.get("device_code") or "",
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    "scope": MICROSOFT_OAUTH_SCOPES,
-                },
-                timeout=10,
-            )
+            async with httpx.AsyncClient(timeout=_MS_OAUTH_HTTP_TIMEOUT) as client:
+                resp = await client.post(
+                    _microsoft_token_endpoint(),
+                    data={
+                        "client_id": client_id,
+                        "device_code": pending.get("device_code") or "",
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                        "scope": MICROSOFT_OAUTH_SCOPES,
+                    },
+                )
         except Exception as e:
             return DeviceFlowPoll.pending(f"poll error: {e}")
         try:
@@ -6338,8 +6328,8 @@ def setup_email_routes():
                 row = db.query(EmailAccount).filter(EmailAccount.id == account_id).first()
                 if not row:
                     return DeviceFlowPoll.failed("Email account disappeared — save it and retry")
-                if owner and row.owner and row.owner != owner:
-                    return DeviceFlowPoll.failed("This email account belongs to another user")
+                if owner and not _account_visible_to_owner(row, owner):
+                    return DeviceFlowPoll.failed("Email account disappeared — save it and retry")
                 # SECURITY: a reconnect must prove the token belongs to the
                 # mailbox configured on this row (mirrors the Google flow) —
                 # otherwise authorizing a different Microsoft account pairs
@@ -6392,6 +6382,9 @@ def setup_email_routes():
             store=PendingDeviceFlowStore(),
             start_flow=_start_ms_device_flow,
             poll_flow=_poll_ms_device_flow,
+            # Connecting one's own mailbox is an owner action, like the rest
+            # of the email account routes — not admin-only.
+            authorize=lambda request: require_user(request) or "",
         )
     )
 
