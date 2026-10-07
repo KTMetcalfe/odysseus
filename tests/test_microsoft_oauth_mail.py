@@ -609,3 +609,57 @@ def test_outlook_note_keeps_most_accounts_wording():
     src = _settings_js()
     assert src.count("Most Outlook and Microsoft 365 accounts no longer accept passwords") == 2
     assert "devicelogin" not in src
+
+
+# --- Settings UI: the sign-in-created row is the one the form keeps editing --
+#
+# Microsoft's sign-in stays on the form (Google's redirects away), so the row
+# the OAuth button creates must be the one Save / Test use afterwards. Before
+# this, Create POSTed a second, token-less copy and Test sent no account id.
+
+
+def test_account_forms_never_choose_post_vs_put_from_isedit():
+    src = _settings_js()
+    assert "isEdit ? `/api/email/accounts/" not in src
+    assert src.count("const url = savedId ? `/api/email/accounts/${savedId}` : '/api/email/accounts';") == 4
+    assert src.count("const method = savedId ? 'PUT' : 'POST';") == 4
+
+
+@pytest.mark.parametrize("init", [
+    "let savedId = isEdit ? a.id : null;",       # legacy eaf form
+    "let savedId = isEdit ? editId : null;",     # live uf form
+])
+def test_each_form_tracks_the_saved_row(init):
+    assert _settings_js().count(init) == 1
+
+
+def test_oauth_button_adopts_the_row_it_created():
+    src = _settings_js()
+    assert src.count("if (!savedId) savedId = d.id;") == 1          # eaf
+    assert "if (!savedId) {\n        savedId = d.id;" in src          # uf
+    assert src.count("const accId = savedId;") == 2
+
+
+def test_live_form_test_uses_saved_row_and_blocks_unsigned_oauth():
+    src = _settings_js()
+    block = src[src.index("el('uf-email-test').addEventListener('click'"):]
+    block = block[:block.index("btn.disabled = true;")]
+    assert "if (savedId && !body.imap_password) body.account_id = savedId;" in block
+    assert "'Sign in with Microsoft first'" in block
+
+
+def test_successful_microsoft_sign_in_refreshes_integrations():
+    for block in _ms_device_flow_blocks():
+        authorized = block[block.index("if (result.status === 'authorized')"):block.index("} else if (result.status === 'expired')")]
+        assert "renderList();" in authorized
+        assert "notifyIntegrationsChanged();" in authorized
+
+
+def test_outlook_note_is_one_sentence_without_env_var():
+    src = _settings_js()
+    note = 'Most Outlook and Microsoft 365 accounts no longer accept passwords for IMAP/SMTP — use "Sign in with Microsoft" below, or choose Custom if your Exchange server still allows them.'
+    assert src.count(note) == 2
+    # A missing client id is reported when sign-in starts, like Google's.
+    for line in src.splitlines():
+        if "no longer accept passwords" in line:
+            assert "MICROSOFT_OAUTH_CLIENT_ID" not in line

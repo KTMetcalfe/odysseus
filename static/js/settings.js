@@ -2756,6 +2756,11 @@ async function initEmailAccountsSettings() {
   function showForm(existing) {
     const a = existing || {};
     const isEdit = !!existing;
+    // The account row this form writes to. Starts as the edited row; the
+    // Microsoft sign-in (which stays on this form, unlike Google's redirect)
+    // creates the row first, and every later Save must update that row
+    // rather than POST a second, token-less copy.
+    let savedId = isEdit ? a.id : null;
     formEl.style.display = '';
     // Small `?` indicator next to each label. Hover/focus to read the
     // hint via the native `title` tooltip. tabindex makes it
@@ -2849,7 +2854,7 @@ async function initEmailAccountsSettings() {
     const eafProviderNotes = {
       outlook: {
         title: 'Outlook / Office 365 uses Microsoft sign-in',
-        body: 'Most Outlook and Microsoft 365 accounts no longer accept passwords for IMAP/SMTP. Use "Sign in with Microsoft" below. If your Exchange server still accepts passwords, choose Custom instead. Requires MICROSOFT_OAUTH_CLIENT_ID to be set by the admin.',
+        body: 'Most Outlook and Microsoft 365 accounts no longer accept passwords for IMAP/SMTP — use "Sign in with Microsoft" below, or choose Custom if your Exchange server still allows them.',
       },
     };
     const eafNoteEl = el('eaf-provider-note');
@@ -2920,6 +2925,10 @@ async function initEmailAccountsSettings() {
           status.textContent = '✓ Connected via Microsoft OAuth' + (email ? ` (${email})` : '');
           btn.textContent = 'Reconnect with Microsoft';
           clearBox();
+          // The row exists and is connected now — show it without waiting
+          // for a Save.
+          renderList();
+          notifyIntegrationsChanged();
         } else if (result.status === 'expired') {
           status.textContent = 'Microsoft sign-in timed out — try again';
           clearBox();
@@ -2952,12 +2961,13 @@ async function initEmailAccountsSettings() {
         smtp_user: el('eaf-imap-user').value.trim(),
       };
       if (!body.name) { el('eaf-msg').textContent = 'Enter a Name or Email first'; el('eaf-msg').style.color = 'var(--red)'; return; }
-      const url = isEdit ? `/api/email/accounts/${a.id}` : '/api/email/accounts';
-      const method = isEdit ? 'PUT' : 'POST';
+      const url = savedId ? `/api/email/accounts/${savedId}` : '/api/email/accounts';
+      const method = savedId ? 'PUT' : 'POST';
       const r = await fetch(url, { method, credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const d = await r.json();
       if (!d.ok) { el('eaf-msg').textContent = d.error || 'Save failed'; el('eaf-msg').style.color = 'var(--red)'; return; }
-      const accId = isEdit ? a.id : d.id;
+      if (!savedId) savedId = d.id;
+      const accId = savedId;
       if (p.oauth === 'google') {
         window.location.href = `/api/email/oauth/google/authorize?account_id=${encodeURIComponent(accId)}`;
       } else if (p.oauth === 'microsoft') {
@@ -3008,8 +3018,8 @@ async function initEmailAccountsSettings() {
       if (!body.name) { el('eaf-msg').textContent = 'Need at least a Name or Email'; el('eaf-msg').style.color = 'var(--red)'; return; }
 
       try {
-        const url = isEdit ? `/api/email/accounts/${a.id}` : '/api/email/accounts';
-        const method = isEdit ? 'PUT' : 'POST';
+        const url = savedId ? `/api/email/accounts/${savedId}` : '/api/email/accounts';
+        const method = savedId ? 'PUT' : 'POST';
         const r = await fetch(url, {
           method, credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
@@ -4300,6 +4310,9 @@ async function initUnifiedIntegrations() {
   // /api/email/config which would overwrite the default.
   async function showEmailForm(editId) {
     const isEdit = editId && editId !== 'new' && editId !== '__email__';
+    // The account row this form writes to (see the legacy form's savedId):
+    // the Microsoft sign-in creates the row and the form keeps editing it.
+    let savedId = isEdit ? editId : null;
     let existing = null;
     if (isEdit) {
       try {
@@ -4433,7 +4446,7 @@ async function initUnifiedIntegrations() {
       },
       outlook: {
         title: 'Outlook / Office 365 uses Microsoft sign-in',
-        body: 'Most Outlook and Microsoft 365 accounts no longer accept passwords for IMAP/SMTP. Use "Sign in with Microsoft" below. If your Exchange server still accepts passwords, choose Custom instead. Requires MICROSOFT_OAUTH_CLIENT_ID to be set by the admin.',
+        body: 'Most Outlook and Microsoft 365 accounts no longer accept passwords for IMAP/SMTP — use "Sign in with Microsoft" below, or choose Custom if your Exchange server still allows them.',
         url: 'https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/disable-basic-authentication-in-exchange-online',
         linkLabel: 'Read Microsoft note',
       },
@@ -4638,6 +4651,10 @@ async function initUnifiedIntegrations() {
           status.textContent = '✓ Connected via Microsoft OAuth' + (email ? ` (${email})` : '');
           btn.textContent = 'Reconnect with Microsoft';
           clearBox();
+          // The row exists and is connected now — show it without waiting
+          // for a Save.
+          renderList();
+          notifyIntegrationsChanged();
         } else if (result.status === 'expired') {
           status.textContent = 'Microsoft sign-in timed out — try again';
           clearBox();
@@ -4660,12 +4677,18 @@ async function initUnifiedIntegrations() {
       const body = _collectBody();
       if (!body.name) body.name = body.from_address;
       if (!body.name) { el('uf-email-msg').textContent = 'Enter a Name or Email first'; el('uf-email-msg').style.color = 'var(--red)'; return; }
-      const url = isEdit ? `/api/email/accounts/${editId}` : '/api/email/accounts';
-      const method = isEdit ? 'PUT' : 'POST';
+      const url = savedId ? `/api/email/accounts/${savedId}` : '/api/email/accounts';
+      const method = savedId ? 'PUT' : 'POST';
       const r = await fetch(url, { method, credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const d = await r.json();
       if (!(d.ok || d.id)) { el('uf-email-msg').textContent = d.error || 'Save failed'; el('uf-email-msg').style.color = 'var(--red)'; return; }
-      const accId = isEdit ? editId : d.id;
+      if (!savedId) {
+        savedId = d.id;
+        // From here on the button updates this row.
+        const lbl = formEl.querySelector('.uf-email-save-label');
+        if (lbl) lbl.textContent = 'Save';
+      }
+      const accId = savedId;
       if (p.oauth === 'google') {
         window.location.href = `/api/email/oauth/google/authorize?account_id=${encodeURIComponent(accId)}`;
       } else if (p.oauth === 'microsoft') {
@@ -4764,7 +4787,15 @@ async function initUnifiedIntegrations() {
       // Edit-mode + blank password = use the saved row's stored creds
       // via the account_id shortcut. Other overrides in the body still
       // win (server merges).
-      if (isEdit && !body.imap_password) body.account_id = editId;
+      if (savedId && !body.imap_password) body.account_id = savedId;
+      // An OAuth account has no password to test until it is signed in.
+      const testProvider = PROVIDERS[el('uf-email-provider').value] || PROVIDERS[_ufSavedOauthKey];
+      if (testProvider && testProvider.oauth && !body.account_id) {
+        const m = el('uf-email-msg');
+        m.textContent = testProvider.oauth === 'microsoft' ? 'Sign in with Microsoft first' : 'Connect with Google first';
+        m.style.color = 'var(--red)';
+        return;
+      }
       const msg = el('uf-email-msg');
       const btn = el('uf-email-test');
       const ico = btn.querySelector('.uf-email-test-ico');
@@ -4847,8 +4878,8 @@ async function initUnifiedIntegrations() {
       saveIcoEl.innerHTML = _spinner;
       saveLblEl.textContent = 'Saving…';
       try {
-        const url = isEdit ? `/api/email/accounts/${editId}` : '/api/email/accounts';
-        const method = isEdit ? 'PUT' : 'POST';
+        const url = savedId ? `/api/email/accounts/${savedId}` : '/api/email/accounts';
+        const method = savedId ? 'PUT' : 'POST';
         const r = await fetch(url, {
           method, credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
