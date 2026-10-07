@@ -647,6 +647,17 @@ def test_live_form_test_uses_saved_row_and_blocks_unsigned_oauth():
     block = block[:block.index("btn.disabled = true;")]
     assert "if (savedId && !body.imap_password) body.account_id = savedId;" in block
     assert "'Sign in with Microsoft first'" in block
+    # Gated on a completed sign-in, not merely on the row existing.
+    assert "if (testProvider && testProvider.oauth && !oauthConnected) {" in block
+
+
+def test_completed_sign_in_marks_the_form_connected():
+    src = _settings_js()
+    assert "let oauthConnected = !!(isEdit && a.oauth_provider);" in src
+    assert "let oauthConnected = !!(existing && existing.oauth_provider);" in src
+    for block in _ms_device_flow_blocks():
+        authorized = block[block.index("if (result.status === 'authorized')"):block.index("} else if (result.status === 'expired')")]
+        assert "oauthConnected = true;" in authorized
 
 
 def test_successful_microsoft_sign_in_refreshes_integrations():
@@ -664,3 +675,11 @@ def test_outlook_note_is_one_sentence_without_env_var():
     for line in src.splitlines():
         if "no longer accept passwords" in line:
             assert "MICROSOFT_OAUTH_CLIENT_ID" not in line
+
+
+def test_live_form_reads_existing_only_after_declaring_it():
+    # `let` is in its temporal dead zone until declared: reading `existing`
+    # earlier throws and the whole Add Email form fails to open.
+    src = _settings_js()
+    body = src[src.index("async function showEmailForm(editId) {"):]
+    assert body.index("let existing = null;") < body.index("let oauthConnected = !!(existing")
