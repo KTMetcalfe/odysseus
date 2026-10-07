@@ -727,3 +727,61 @@ def test_device_poll_adopts_identity_for_a_blank_account(device_app):
         assert row.oauth_provider == "microsoft"
     finally:
         db.close()
+
+
+# --- Saving an OAuth account must not erase the verified usernames ------------
+#
+# Regression: the sign-in filled the blank Username fields server-side, then
+# the form's Save sent its still-blank fields and wiped them, leaving IMAP and
+# SMTP to authenticate as "".
+
+
+@pytest.mark.parametrize("provider, kept", [("microsoft", True), (None, False)])
+def test_put_with_blank_usernames_keeps_them_only_on_oauth_rows(device_app, provider, kept):
+    from core.database import EmailAccount
+
+    account_id = _make_account(device_app.db, owner="alice", imap_user="alice@contoso.com", provider=provider)
+    db = device_app.db()
+    try:
+        row = db.get(EmailAccount, account_id)
+        row.smtp_user = "alice@contoso.com"
+        db.commit()
+    finally:
+        db.close()
+
+    r = device_app.client.put(
+        f"/api/email/accounts/{account_id}",
+        json={"name": "Renamed", "imap_user": "", "smtp_user": "", "imap_host": "outlook.office365.com"},
+        headers=_as("alice"),
+    )
+    assert r.status_code == 200, r.text
+
+    db = device_app.db()
+    try:
+        row = db.get(EmailAccount, account_id)
+        assert row.name == "Renamed"
+        expected = "alice@contoso.com" if kept else ""
+        assert (row.imap_user or "") == expected
+        assert (row.smtp_user or "") == expected
+    finally:
+        db.close()
+
+
+def test_put_can_still_change_an_oauth_rows_username(device_app):
+    from core.database import EmailAccount
+
+    account_id = _make_account(device_app.db, owner="alice", imap_user="alice@contoso.com")
+    device_app.client.put(f"/api/email/accounts/{account_id}", json={"imap_user": "bob@contoso.com"}, headers=_as("alice"))
+    db = device_app.db()
+    try:
+        assert db.get(EmailAccount, account_id).imap_user == "bob@contoso.com"
+    finally:
+        db.close()
+
+
+def test_successful_sign_in_fills_blank_usernames_in_the_form():
+    for block in _ms_device_flow_blocks():
+        authorized = block[block.index("if (result.status === 'authorized')"):block.index("} else if (result.status === 'expired')")]
+        prefix = "eaf" if "el('eaf-imap-user')" in authorized else "uf"
+        assert f"if (!el('{prefix}-imap-user').value.trim()) el('{prefix}-imap-user').value = email;" in authorized
+        assert f"if (!el('{prefix}-smtp-user').value.trim()) el('{prefix}-smtp-user').value = email;" in authorized

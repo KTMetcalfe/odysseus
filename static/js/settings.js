@@ -2927,6 +2927,12 @@ async function initEmailAccountsSettings() {
           status.textContent = '✓ Connected via Microsoft OAuth' + (email ? ` (${email})` : '');
           btn.textContent = 'Reconnect with Microsoft';
           oauthConnected = true;
+          // The server fills blank usernames with the signed-in mailbox; show
+          // that here too, or the next Save sends the blanks back.
+          if (email) {
+            if (!el('eaf-imap-user').value.trim()) el('eaf-imap-user').value = email;
+            if (!el('eaf-smtp-user').value.trim()) el('eaf-smtp-user').value = email;
+          }
           clearBox();
           // The row exists and is connected now — show it without waiting
           // for a Save.
@@ -4658,6 +4664,12 @@ async function initUnifiedIntegrations() {
           status.textContent = '✓ Connected via Microsoft OAuth' + (email ? ` (${email})` : '');
           btn.textContent = 'Reconnect with Microsoft';
           oauthConnected = true;
+          // The server fills blank usernames with the signed-in mailbox; show
+          // that here too, or the next Save sends the blanks back.
+          if (email) {
+            if (!el('uf-imap-user').value.trim()) el('uf-imap-user').value = email;
+            if (!el('uf-smtp-user').value.trim()) el('uf-smtp-user').value = email;
+          }
           clearBox();
           // The row exists and is connected now — show it without waiting
           // for a Save.

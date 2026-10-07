@@ -5719,7 +5719,14 @@ def setup_email_routes():
             # Simple fields
             for key in ("name", "imap_host", "imap_user", "smtp_host", "smtp_user", "from_address", "display_name"):
                 if key in data:
-                    setattr(row, key, (data[key] or "").strip())
+                    value = (data[key] or "").strip()
+                    # An OAuth account's usernames are the mailbox the sign-in
+                    # verified (and filled in when they were blank). A form that
+                    # still shows them blank must not erase them — like passwords,
+                    # they only change when a value is given.
+                    if not value and key in ("imap_user", "smtp_user") and row.oauth_provider:
+                        continue
+                    setattr(row, key, value)
             for key in ("imap_port", "smtp_port"):
                 if data.get(key) not in (None, ""):
                     port, port_err = _coerce_port(data.get(key), None)
