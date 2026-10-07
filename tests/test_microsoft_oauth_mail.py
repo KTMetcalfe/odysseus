@@ -1,14 +1,18 @@
 """Microsoft (Outlook / Office 365) mail OAuth coverage.
 
-Scopes, ID-token identity parsing, OAuth transport allowlists, refresh-token
-rotation, and the XOAUTH2 wiring on the SMTP send path.
+Scopes (against Microsoft's documented contract), OAuth host/transport policy
+on every credential-bearing path, refresh-token rotation, the owner-scoped
+device-code routes, and the XOAUTH2 wiring on the SMTP send path.
 """
 
 import base64
 import json
 
+import httpx
 import pytest
 from types import SimpleNamespace
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
 def _jwt(claims):
@@ -38,7 +42,7 @@ def account_db(tmp_path, monkeypatch):
     engine.dispose()
 
 
-def _make_account(factory, *, imap_user="info@craftale.it", provider="microsoft"):
+def _make_account(factory, *, imap_user="info@craftale.it", provider="microsoft", owner="admin"):
     import uuid
 
     from core.database import EmailAccount
@@ -48,7 +52,7 @@ def _make_account(factory, *, imap_user="info@craftale.it", provider="microsoft"
     try:
         row = EmailAccount(
             id=f"acc-{uuid.uuid4().hex[:12]}",
-            owner="admin",
+            owner=owner,
             name="Craftale",
             from_address=imap_user,
             imap_host="outlook.office365.com",
@@ -68,11 +72,21 @@ def _make_account(factory, *, imap_user="info@craftale.it", provider="microsoft"
 # --- Scopes -----------------------------------------------------------------
 
 
+# Microsoft documents the IMAP/SMTP OAuth scopes under the outlook.office.com
+# resource: https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth
+_DOCUMENTED_SCOPES = {
+    "https://outlook.office.com/IMAP.AccessAsUser.All",
+    "https://outlook.office.com/SMTP.Send",
+}
+
+
 def test_scopes_contain_required_grants():
     from routes.email_helpers import MICROSOFT_OAUTH_SCOPES
 
-    assert "https://outlook.office365.com/IMAP.AccessAsUser.All" in MICROSOFT_OAUTH_SCOPES
-    assert "https://outlook.office365.com/SMTP.Send" in MICROSOFT_OAUTH_SCOPES
+    scopes = set(MICROSOFT_OAUTH_SCOPES.split())
+    assert _DOCUMENTED_SCOPES <= scopes
+    # The outlook.office365.com resource is not the documented one.
+    assert not any("outlook.office365.com" in s for s in scopes)
     assert "offline_access" in MICROSOFT_OAUTH_SCOPES
     # Identity claims ride along so the connect flow can verify the mailbox.
     assert "openid" in MICROSOFT_OAUTH_SCOPES and "email" in MICROSOFT_OAUTH_SCOPES
@@ -96,11 +110,11 @@ def test_configured_requires_client_id(monkeypatch):
     assert microsoft_oauth_configured() is True
 
 
-# --- Transport allowlists (routes module) -----------------------------------
+# --- Transport allowlists ---------------------------------------------------
 
 
 def test_microsoft_transport_allowlists():
-    from routes.email_routes import (
+    from routes.email_helpers import (
         _microsoft_oauth_imap_transport_allowed,
         _microsoft_oauth_smtp_transport_allowed,
     )
@@ -116,13 +130,91 @@ def test_microsoft_transport_allowlists():
 
 
 def test_microsoft_oauth_hosts_are_pinned():
-    from routes.email_routes import (
-        _MICROSOFT_OAUTH_IMAP_HOSTS,
-        _MICROSOFT_OAUTH_SMTP_HOSTS,
+    from routes.email_helpers import (
+        MICROSOFT_OAUTH_IMAP_HOSTS,
+        MICROSOFT_OAUTH_SMTP_HOSTS,
     )
 
-    assert _MICROSOFT_OAUTH_IMAP_HOSTS == {"outlook.office365.com"}
-    assert _MICROSOFT_OAUTH_SMTP_HOSTS == {"smtp.office365.com"}
+    assert MICROSOFT_OAUTH_IMAP_HOSTS == {"outlook.office365.com"}
+    # smtp-mail.outlook.com is the submission host for personal accounts,
+    # which the default 'common' tenant admits.
+    assert MICROSOFT_OAUTH_SMTP_HOSTS == {"smtp.office365.com", "smtp-mail.outlook.com"}
+
+
+@pytest.mark.parametrize(
+    "host, port, starttls",
+    [
+        ("evil.example.com", 993, False),       # wrong host
+        ("outlook.office365.com.evil.io", 993, False),
+        ("outlook.office365.com", 143, False),  # plaintext IMAP
+        ("outlook.office365.com", 993, True),
+    ],
+)
+def test_imap_connect_rejects_bad_microsoft_endpoint_before_token(monkeypatch, host, port, starttls):
+    from routes import email_helpers
+
+    cfg = {
+        "account_id": "acc-1",
+        "oauth_provider": "microsoft",
+        "imap_host": host,
+        "imap_port": port,
+        "imap_starttls": starttls,
+        "imap_user": "me@contoso.com",
+    }
+    monkeypatch.setattr(email_helpers, "_get_email_config", lambda *a, **kw: dict(cfg))
+
+    def no_token(*a, **kw):
+        raise AssertionError("token must not be fetched for a disallowed endpoint")
+
+    def no_connect(*a, **kw):
+        raise AssertionError("must not connect to a disallowed endpoint")
+
+    monkeypatch.setattr(email_helpers, "_get_valid_microsoft_token", no_token)
+    monkeypatch.setattr(email_helpers, "_open_imap_connection", no_connect)
+    with pytest.raises(email_helpers.OAuthTransportPolicyError):
+        email_helpers._imap_connect("acc-1")
+
+
+@pytest.mark.parametrize(
+    "host, port, security",
+    [
+        ("evil.example.com", 587, "starttls"),
+        ("smtp.office365.com", 25, "none"),
+        ("smtp.office365.com", 587, "none"),
+        ("smtp.office365.com", 465, "ssl"),
+    ],
+)
+def test_smtp_send_rejects_bad_microsoft_endpoint_before_token(monkeypatch, host, port, security):
+    from routes import email_helpers
+
+    def no_token(*a, **kw):
+        raise AssertionError("token must not be fetched for a disallowed endpoint")
+
+    def no_connect(*a, **kw):
+        raise AssertionError("must not connect to a disallowed endpoint")
+
+    monkeypatch.setattr(email_helpers, "_get_valid_microsoft_token", no_token)
+    monkeypatch.setattr(email_helpers, "_PolicySMTP", no_connect)
+    monkeypatch.setattr(email_helpers, "_PolicySMTP_SSL", no_connect)
+    cfg = {
+        "account_id": "acc-1",
+        "oauth_provider": "microsoft",
+        "smtp_host": host,
+        "smtp_port": port,
+        "smtp_user": "me@contoso.com",
+        "smtp_security": security,
+    }
+    with pytest.raises(email_helpers.OAuthTransportPolicyError):
+        email_helpers._send_smtp_message(cfg, "me@contoso.com", ["x@example.com"], "body")
+
+
+def test_password_accounts_skip_microsoft_policy():
+    from routes.email_helpers import microsoft_oauth_smtp_policy_error
+
+    # The policy is only consulted for oauth_provider == "microsoft"; it must
+    # still accept the documented endpoints.
+    assert microsoft_oauth_smtp_policy_error("smtp.office365.com", 587, "starttls") is None
+    assert microsoft_oauth_smtp_policy_error("SMTP-MAIL.outlook.com.", 587, "starttls") is None
 
 
 # --- Refresh flow -----------------------------------------------------------
@@ -158,7 +250,7 @@ def test_refresh_rotates_tokens_and_persists(account_db, monkeypatch):
     assert "login.microsoftonline.com/common/oauth2/v2.0/token" in captured["url"]
     assert captured["data"]["grant_type"] == "refresh_token"
     assert captured["data"]["refresh_token"] == "old-refresh"
-    assert captured["data"]["scope"].startswith("https://outlook.office365.com/")
+    assert _DOCUMENTED_SCOPES <= set(captured["data"]["scope"].split())
 
     db = account_db()
     try:
@@ -206,7 +298,6 @@ def test_valid_token_uses_cache_without_refresh(account_db, monkeypatch):
 
 
 def test_smtp_send_authenticates_xoauth2_for_microsoft(monkeypatch):
-    import smtplib
     from routes import email_helpers
     from routes.email_helpers import _send_smtp_message, _xoauth2_raw
 
@@ -219,7 +310,7 @@ def test_smtp_send_authenticates_xoauth2_for_microsoft(monkeypatch):
     calls = {"auth": None, "login": False, "starttls": False}
 
     class FakeSMTP:
-        def __init__(self, host, port, timeout=None):
+        def __init__(self, host, port, timeout=None, block_private=None):
             pass
 
         def __enter__(self):
@@ -246,7 +337,8 @@ def test_smtp_send_authenticates_xoauth2_for_microsoft(monkeypatch):
         def quit(self):
             pass
 
-    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    # _send_smtp_message dials through the policy-checked subclass.
+    monkeypatch.setattr(email_helpers, "_PolicySMTP", FakeSMTP)
     cfg = {
         "account_id": "acc-1",
         "oauth_provider": "microsoft",
@@ -262,3 +354,231 @@ def test_smtp_send_authenticates_xoauth2_for_microsoft(monkeypatch):
     mechanism, auth_cb = calls["auth"]
     assert mechanism == "XOAUTH2"
     assert auth_cb() == _xoauth2_raw("info@craftale.it", "ms-access-token")
+
+
+# --- Device-code routes (owner-scoped, non-blocking) ------------------------
+#
+# These boot the real email router in a minimal FastAPI app. A tiny middleware
+# stamps request.state.current_user from a test header, as the auth middleware
+# does in production; nobody here is an admin.
+
+_DEVICE = "/api/email/oauth/microsoft/device"
+
+
+class _FakeAsyncClient:
+    """Stands in for httpx.AsyncClient; replies from a per-test script."""
+
+    script: dict = {}
+    calls: list = []
+    timeouts: list = []
+    gate = None
+
+    def __init__(self, *args, timeout=None, **kwargs):
+        type(self).timeouts.append(timeout)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, data=None, **kwargs):
+        import httpx
+
+        type(self).calls.append((url, dict(data or {})))
+        if type(self).gate is not None:
+            await type(self).gate.wait()
+        kind = "devicecode" if url.endswith("/devicecode") else "token"
+        status, payload = type(self).script[kind]
+        return httpx.Response(status, json=payload, request=httpx.Request("POST", url))
+
+
+@pytest.fixture
+def device_app(account_db, monkeypatch):
+    import httpx
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from routes.email_routes import setup_email_routes
+
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("MICROSOFT_OAUTH_CLIENT_ID", "client-123")
+    monkeypatch.delenv("MICROSOFT_OAUTH_TENANT", raising=False)
+
+    fake = type("FakeAsyncClient", (_FakeAsyncClient,), {
+        "script": {
+            "devicecode": (200, {
+                "device_code": "dev-code",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "https://microsoft.com/devicelogin",
+                "interval": 1,
+                "expires_in": 900,
+            }),
+            "token": (400, {"error": "authorization_pending"}),
+        },
+        "calls": [],
+        "timeouts": [],
+        "gate": None,
+    })
+    monkeypatch.setattr(httpx, "AsyncClient", fake)
+
+    def blocking_post(*a, **kw):
+        raise AssertionError("device-flow handlers must not use blocking httpx.post")
+
+    monkeypatch.setattr(httpx, "post", blocking_post)
+
+    app = FastAPI()
+    app.state.auth_manager = SimpleNamespace(is_configured=True, is_admin=lambda user: False)
+
+    @app.middleware("http")
+    async def _stamp_user(request, call_next):
+        request.state.current_user = request.headers.get("x-test-user") or None
+        return await call_next(request)
+
+    app.include_router(setup_email_routes())
+    return SimpleNamespace(app=app, client=TestClient(app), fake=fake, db=account_db)
+
+
+def _as(user):
+    return {"x-test-user": user} if user else {}
+
+
+def test_device_start_is_open_to_the_non_admin_account_owner(device_app):
+    account_id = _make_account(device_app.db, owner="alice")
+
+    r = device_app.client.post(f"{_DEVICE}/start", data={"account_id": account_id}, headers=_as("alice"))
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["poll_id"] and body["user_code"] == "ABCD-EFGH"
+    url, data = device_app.fake.calls[0]
+    assert url == "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
+    assert _DOCUMENTED_SCOPES <= set(data["scope"].split())
+    # Every Microsoft call made from the event loop carries a bounded timeout.
+    assert device_app.fake.timeouts and all(t and t <= 10 for t in device_app.fake.timeouts)
+
+
+def test_device_start_requires_authentication(device_app):
+    account_id = _make_account(device_app.db, owner="alice")
+    r = device_app.client.post(f"{_DEVICE}/start", data={"account_id": account_id})
+    assert r.status_code == 401
+    assert device_app.fake.calls == []
+
+
+def test_device_start_refuses_another_users_account(device_app):
+    account_id = _make_account(device_app.db, owner="alice")
+    r = device_app.client.post(f"{_DEVICE}/start", data={"account_id": account_id}, headers=_as("bob"))
+    assert r.status_code == 404
+    assert device_app.fake.calls == []
+
+
+def test_device_poll_and_cancel_are_bound_to_the_initiator(device_app):
+    account_id = _make_account(device_app.db, owner="alice")
+    poll_id = device_app.client.post(
+        f"{_DEVICE}/start", data={"account_id": account_id}, headers=_as("alice"),
+    ).json()["poll_id"]
+
+    assert device_app.client.post(f"{_DEVICE}/poll", data={"poll_id": poll_id}, headers=_as("bob")).status_code == 404
+    assert device_app.client.post(f"{_DEVICE}/cancel", data={"poll_id": poll_id}, headers=_as("bob")).status_code == 404
+
+    # Bob's attempts neither consumed nor cancelled Alice's flow.
+    r = device_app.client.post(f"{_DEVICE}/poll", data={"poll_id": poll_id}, headers=_as("alice"))
+    assert r.status_code == 200 and r.json()["status"] == "pending"
+
+
+def test_device_poll_stores_tokens_for_the_matching_mailbox(device_app):
+    from core.database import EmailAccount
+    from src.secret_storage import decrypt
+
+    account_id = _make_account(device_app.db, owner="alice", imap_user="alice@contoso.com")
+    poll_id = device_app.client.post(
+        f"{_DEVICE}/start", data={"account_id": account_id}, headers=_as("alice"),
+    ).json()["poll_id"]
+    device_app.fake.script["token"] = (200, {
+        "access_token": "ms-access",
+        "refresh_token": "ms-refresh",
+        "expires_in": 3600,
+        # UPN is what's trusted; a spoofable `email` claim must not win.
+        "id_token": _jwt({"preferred_username": "Alice@Contoso.com", "email": "victim@example.com"}),
+    })
+
+    r = device_app.client.post(f"{_DEVICE}/poll", data={"poll_id": poll_id}, headers=_as("alice"))
+
+    assert r.json() == {"status": "authorized", "endpoint": {"account_id": account_id, "email": "Alice@Contoso.com"}}
+    url, data = device_app.fake.calls[-1]
+    assert url.endswith("/common/oauth2/v2.0/token")
+    assert data["grant_type"] == "urn:ietf:params:oauth:grant-type:device_code"
+    assert _DOCUMENTED_SCOPES <= set(data["scope"].split())
+    db = device_app.db()
+    try:
+        row = db.get(EmailAccount, account_id)
+        assert row.oauth_provider == "microsoft"
+        assert decrypt(row.oauth_access_token) == "ms-access"
+        assert decrypt(row.oauth_refresh_token) == "ms-refresh"
+    finally:
+        db.close()
+
+
+async def test_slow_microsoft_endpoint_does_not_block_other_requests(device_app):
+    import asyncio
+    import httpx
+
+    account_id = _make_account(device_app.db, owner="alice")
+    device_app.fake.gate = asyncio.Event()
+    transport = httpx.ASGITransport(app=device_app.app)
+    # The fake replaces httpx.AsyncClient, so build the test client from the
+    # real class captured before patching.
+    async with _REAL_ASYNC_CLIENT(transport=transport, base_url="http://test") as client:
+        slow = asyncio.create_task(client.post(
+            f"{_DEVICE}/start", data={"account_id": account_id}, headers=_as("alice"),
+        ))
+
+        async def _microsoft_called():
+            while not device_app.fake.calls:
+                assert not slow.done(), (await slow).text
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_microsoft_called(), timeout=2)
+        # Microsoft hasn't answered; an unrelated request must still be served.
+        other = await asyncio.wait_for(
+            client.post(f"{_DEVICE}/cancel", data={"poll_id": "nope"}, headers=_as("alice")),
+            timeout=2,
+        )
+        assert other.status_code == 200
+        assert not slow.done()
+        device_app.fake.gate.set()
+        assert (await slow).status_code == 200
+
+
+# --- Settings UI: reconnect restores the provider ---------------------------
+
+
+def _settings_js():
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parents[1] / "static" / "js" / "settings.js").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("form, select_id", [("eaf", "eaf-provider"), ("uf", "uf-email-provider")])
+def test_edit_form_restores_oauth_provider_for_reconnect(form, select_id):
+    import re
+
+    src = _settings_js()
+    # Saved oauth_provider → preset key, for both Google and Microsoft.
+    assert src.count("const _OAUTH_PROVIDER_KEYS = { google: 'google_workspace', microsoft: 'outlook' };") == 2
+    saved = f"_{form}SavedOauthKey"
+    # The selector is restored from the saved account...
+    assert re.search(rf"el\('{select_id}'\)\.value = {saved};", src)
+    # ...and the Reconnect handler falls back to it if the selector is blank.
+    assert re.search(
+        rf"el\('{form}-oauth-btn'\)\.addEventListener\('click', async \(\) => \{{\s*"
+        rf"const p = PROVIDERS\[el\('{select_id}'\)\.value\] \|\| PROVIDERS\[{saved}\];",
+        src,
+    )
+
+
+def test_live_form_restores_provider_before_dropdown_label_is_drawn():
+    src = _settings_js()
+    restore = src.index("if (_ufSavedOauthKey) el('uf-email-provider').value = _ufSavedOauthKey;")
+    dropdown = src.index("// Custom dropdown wire-up")
+    assert restore < dropdown

@@ -2417,6 +2417,8 @@ async function initEmailAccountsSettings() {
       google:    { title: 'Google OAuth2 — required for Workspace / .edu accounts', connect: 'Connect with Google',    reconnect: 'Reconnect with Google',    connected: '✓ Connected via Google OAuth' },
       microsoft: { title: 'Microsoft OAuth2 — required for Outlook / Office 365',   connect: 'Sign in with Microsoft', reconnect: 'Reconnect with Microsoft', connected: '✓ Connected via Microsoft OAuth' },
     };
+    // Saved `oauth_provider` → the provider-preset key that drives the form.
+    const _OAUTH_PROVIDER_KEYS = { google: 'google_workspace', microsoft: 'outlook' };
     function _syncOauthUI(providerKey) {
       const p = PROVIDERS[providerKey];
       const isOauth = !!(p && p.oauth);
@@ -2467,9 +2469,14 @@ async function initEmailAccountsSettings() {
       _syncOauthUI(e.target.value);
     });
 
-    // Init OAuth UI for accounts already connected via OAuth.
-    if (a.oauth_provider === 'google') _syncOauthUI('google_workspace');
-    else if (a.oauth_provider === 'microsoft') _syncOauthUI('outlook');
+    // Init OAuth UI for accounts already connected via OAuth. Restore the
+    // provider selector too (without firing `change`, which would overwrite
+    // the saved host/port) so the Reconnect button has a provider to act on.
+    const _eafSavedOauthKey = _OAUTH_PROVIDER_KEYS[a.oauth_provider] || '';
+    if (_eafSavedOauthKey) {
+      el('eaf-provider').value = _eafSavedOauthKey;
+      _syncOauthUI(_eafSavedOauthKey);
+    }
 
     // "Connect with Google" / "Sign in with Microsoft" — save the account
     // first, then redirect to Google OAuth or run the Microsoft device-code
@@ -2544,7 +2551,7 @@ async function initEmailAccountsSettings() {
     }
 
     el('eaf-oauth-btn').addEventListener('click', async () => {
-      const p = PROVIDERS[el('eaf-provider').value];
+      const p = PROVIDERS[el('eaf-provider').value] || PROVIDERS[_eafSavedOauthKey];
       if (!p || !p.oauth) return;
       // Must save the account first to get an account_id to pass to the OAuth flow.
       const body = {
@@ -4117,6 +4124,8 @@ async function initUnifiedIntegrations() {
       google:    { title: 'Google OAuth2 — required for Workspace / .edu accounts', connect: 'Connect with Google',    reconnect: 'Reconnect with Google',    connected: '✓ Connected via Google OAuth' },
       microsoft: { title: 'Microsoft OAuth2 — required for Outlook / Office 365',   connect: 'Sign in with Microsoft', reconnect: 'Reconnect with Microsoft', connected: '✓ Connected via Microsoft OAuth' },
     };
+    // Saved `oauth_provider` → the provider-preset key that drives the form.
+    const _OAUTH_PROVIDER_KEYS = { google: 'google_workspace', microsoft: 'outlook' };
     function _syncOauthUI(providerKey) {
       const p = PROVIDERS[providerKey];
       const isOauth = !!(p && p.oauth);
@@ -4132,6 +4141,12 @@ async function initUnifiedIntegrations() {
         r.style.display = isOauth ? 'none' : '';
       });
     }
+
+    // Accounts already connected via OAuth: restore the provider selector
+    // before the custom dropdown below reads it for its label. Not via
+    // `change`, which would overwrite the saved host/port with the preset.
+    const _ufSavedOauthKey = _OAUTH_PROVIDER_KEYS[existing && existing.oauth_provider] || '';
+    if (_ufSavedOauthKey) el('uf-email-provider').value = _ufSavedOauthKey;
 
     // Custom dropdown wire-up — the native <select> stays in the DOM as the
     // data source and accessibility target, but the visible UI is a button +
@@ -4208,8 +4223,7 @@ async function initUnifiedIntegrations() {
     });
 
     // Init OAuth UI for accounts already connected via OAuth.
-    if (existing && existing.oauth_provider === 'google') _syncOauthUI('google_workspace');
-    else if (existing && existing.oauth_provider === 'microsoft') _syncOauthUI('outlook');
+    if (_ufSavedOauthKey) _syncOauthUI(_ufSavedOauthKey);
 
     // Microsoft device-code flow — run inline, no redirect URI needed.
     async function _runMsDeviceFlow(accId) {
@@ -4284,7 +4298,7 @@ async function initUnifiedIntegrations() {
     // "Connect with Google" / "Sign in with Microsoft" — save the account
     // first, then redirect to Google OAuth or run the device flow inline.
     el('uf-oauth-btn').addEventListener('click', async () => {
-      const p = PROVIDERS[el('uf-email-provider').value];
+      const p = PROVIDERS[el('uf-email-provider').value] || PROVIDERS[_ufSavedOauthKey];
       if (!p || !p.oauth) return;
       const body = _collectBody();
       if (!body.name) body.name = body.from_address;
