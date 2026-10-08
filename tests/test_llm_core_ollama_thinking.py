@@ -139,6 +139,7 @@ class TestThinkSuppression:
             monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "qwen3:14b"
         )
         assert payload.get("think") is False
+        assert payload.get("reasoning_effort") == "none"
 
     def test_no_think_for_ollama_v1_non_thinking_model(self, monkeypatch):
         """think must NOT be set for a plain (non-thinking) model on Ollama /v1."""
@@ -173,3 +174,35 @@ class TestThinkSuppression:
         )
         assert "think" not in payload
         assert payload["max_tokens"] == llm_core.LLMConfig.DEFAULT_MAX_TOKENS
+
+
+class TestOllamaV1ThinkingMode:
+    """Ollama /v1 ignores ``think``; ``reasoning_effort`` is the real switch."""
+
+    URL = "http://ollama:11434/v1/chat/completions"
+
+    def test_suppression_sets_reasoning_effort_none(self):
+        payload = {}
+        llm_core._suppress_ollama_openai_thinking(payload)
+        assert payload == {"think": False, "reasoning_effort": "none"}
+
+    def test_explicit_on_overrides_default_suppression(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "is_local_endpoint", lambda u: True)
+        payload = {"think": False, "reasoning_effort": "none"}
+        llm_core._apply_local_qwen_thinking_mode(payload, self.URL, "qwen3.5:9b", "on")
+        assert payload["think"] is True
+        assert "reasoning_effort" not in payload
+
+    def test_explicit_off_suppresses(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "is_local_endpoint", lambda u: True)
+        payload = {}
+        llm_core._apply_local_qwen_thinking_mode(payload, self.URL, "qwen3.5:9b", "off")
+        assert payload["think"] is False
+        assert payload["reasoning_effort"] == "none"
+
+    def test_non_ollama_local_server_untouched(self, monkeypatch):
+        monkeypatch.setattr(llm_core, "is_local_endpoint", lambda u: True)
+        payload = {}
+        llm_core._apply_local_qwen_thinking_mode(
+            payload, "http://vllm:8000/v1/chat/completions", "qwen3.5:9b", "off")
+        assert payload == {"chat_template_kwargs": {"enable_thinking": False}}
